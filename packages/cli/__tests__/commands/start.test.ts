@@ -329,7 +329,7 @@ describe("start command — URL argument", () => {
 
     expect(mockExec).toHaveBeenCalledWith(
       "git",
-      ["clone", "https://github.com/owner/my-app.git", repoDir],
+      ["clone", "--depth", "1", "https://github.com/owner/my-app.git", repoDir],
       expect.anything(),
     );
 

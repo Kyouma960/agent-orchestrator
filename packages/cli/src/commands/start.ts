@@ -126,7 +126,7 @@ async function handleUrlStart(url: string): Promise<{ config: OrchestratorConfig
   } else {
     spinner.start(`Cloning ${parsed.ownerRepo}`);
     try {
-      await exec("git", ["clone", parsed.cloneUrl, targetDir], { cwd });
+      await exec("git", ["clone", "--depth", "1", parsed.cloneUrl, targetDir], { cwd });
       spinner.succeed(`Cloned to ${targetDir}`);
     } catch (err) {
       spinner.fail("Clone failed");
