@@ -1,9 +1,138 @@
 import chalk from "chalk";
 import type { Command } from "commander";
-import { loadConfig, SessionNotRestorableError, WorkspaceMissingError } from "@composio/ao-core";
+import { existsSync, readdirSync } from "node:fs";
+import { join } from "node:path";
+import {
+  getSessionsDir,
+  loadConfig,
+  SessionNotRestorableError,
+  WorkspaceMissingError,
+} from "@composio/ao-core";
 import { git, getTmuxActivity } from "../lib/shell.js";
 import { formatAge } from "../lib/format.js";
 import { getSessionManager } from "../lib/create-session-manager.js";
+
+interface BranchPruneResult {
+  deleted: string[];
+  skipped: Array<{ branch: string; reason: string }>;
+  errors: Array<{ branch: string; error: string }>;
+}
+
+async function getMergedSessionBranches(
+  repoPath: string,
+  defaultBranch: string,
+): Promise<Set<string>> {
+  const fromOrigin = await git(
+    ["branch", "--format=%(refname:short)", "--merged", `origin/${defaultBranch}`],
+    repoPath,
+  );
+  const output =
+    fromOrigin ??
+    (await git(["branch", "--format=%(refname:short)", "--merged", defaultBranch], repoPath));
+  if (!output) return new Set<string>();
+  return new Set(
+    output
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) => line.startsWith("session/")),
+  );
+}
+
+async function getAttachedWorktreeBranches(repoPath: string): Promise<Set<string>> {
+  const output = await git(["worktree", "list", "--porcelain"], repoPath);
+  if (!output) return new Set<string>();
+  const branches = new Set<string>();
+  for (const line of output.split("\n")) {
+    if (!line.startsWith("branch ")) continue;
+    const ref = line.slice("branch ".length).trim();
+    if (!ref.startsWith("refs/heads/")) continue;
+    const name = ref.slice("refs/heads/".length);
+    if (name.startsWith("session/")) branches.add(name);
+  }
+  return branches;
+}
+
+function getArchivedSessionIds(configPath: string, projectPath: string): Set<string> {
+  const sessionsDir = getSessionsDir(configPath, projectPath);
+  const archiveDir = join(sessionsDir, "archive");
+  if (!existsSync(archiveDir)) return new Set<string>();
+  const ids = new Set<string>();
+  for (const file of readdirSync(archiveDir)) {
+    const match = file.match(/^([a-zA-Z0-9_-]+)_\d/);
+    if (match?.[1]) ids.add(match[1]);
+  }
+  return ids;
+}
+
+async function pruneSessionBranches(
+  projectId: string | undefined,
+  dryRun: boolean | undefined,
+): Promise<BranchPruneResult> {
+  const config = loadConfig();
+  const sm = await getSessionManager(config);
+  const result: BranchPruneResult = { deleted: [], skipped: [], errors: [] };
+
+  const entries = Object.entries(config.projects).filter(([id]) => !projectId || id === projectId);
+
+  for (const [id, project] of entries) {
+    const repoPath = project.path;
+    const active = await sm.list(id);
+    const activeIds = new Set(active.map((session) => session.id));
+    const archivedIds = getArchivedSessionIds(config.configPath, project.path);
+
+    const allSessionBranchesOut = await git(
+      ["for-each-ref", "--format=%(refname:short)", "refs/heads/session"],
+      repoPath,
+    );
+    if (!allSessionBranchesOut) continue;
+    const allSessionBranches = allSessionBranchesOut
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) => line.startsWith("session/"));
+
+    const mergedBranches = await getMergedSessionBranches(repoPath, project.defaultBranch);
+    const attachedBranches = await getAttachedWorktreeBranches(repoPath);
+    const sessionPrefix = project.sessionPrefix;
+
+    for (const branch of allSessionBranches) {
+      const sessionId = branch.slice("session/".length);
+      if (!sessionId.startsWith(`${sessionPrefix}-`)) {
+        result.skipped.push({ branch, reason: `not ${id} session prefix` });
+        continue;
+      }
+      if (activeIds.has(sessionId)) {
+        result.skipped.push({ branch, reason: "active session" });
+        continue;
+      }
+      if (!archivedIds.has(sessionId)) {
+        result.skipped.push({ branch, reason: "no archived metadata" });
+        continue;
+      }
+      if (attachedBranches.has(branch)) {
+        result.skipped.push({ branch, reason: "worktree still attached" });
+        continue;
+      }
+      if (!mergedBranches.has(branch)) {
+        result.skipped.push({ branch, reason: `not merged into ${project.defaultBranch}` });
+        continue;
+      }
+
+      if (dryRun) {
+        result.deleted.push(branch);
+        continue;
+      }
+
+      const deleted = await git(["branch", "-d", branch], repoPath);
+      if (deleted === null) {
+        result.errors.push({ branch, error: "git branch delete failed" });
+      } else {
+        result.deleted.push(branch);
+      }
+    }
+  }
+
+  return result;
+}
 
 export function registerSession(program: Command): void {
   const session = program.command("session").description("Session management (ls, kill, cleanup)");
@@ -94,8 +223,13 @@ export function registerSession(program: Command): void {
     .description("Kill sessions where PR is merged or issue is closed")
     .option("-p, --project <id>", "Filter by project ID")
     .option("--dry-run", "Show what would be cleaned up without doing it")
-    .action(async (opts: { project?: string; dryRun?: boolean }) => {
+    .option(
+      "--prune-branches",
+      "Also prune safe archived session branches (or set cleanup.pruneBranches in config)",
+    )
+    .action(async (opts: { project?: string; dryRun?: boolean; pruneBranches?: boolean }) => {
       const config = loadConfig();
+      const shouldPruneBranches = opts.pruneBranches ?? config.cleanup?.pruneBranches ?? false;
       if (opts.project && !config.projects[opts.project]) {
         console.error(chalk.red(`Unknown project: ${opts.project}`));
         process.exit(1);
@@ -130,6 +264,20 @@ export function registerSession(program: Command): void {
             );
           }
         }
+
+        if (shouldPruneBranches) {
+          const prune = await pruneSessionBranches(opts.project, true);
+          if (prune.deleted.length === 0 && prune.errors.length === 0) {
+            console.log(chalk.dim("  No session branches would be pruned."));
+          } else {
+            for (const branch of prune.deleted) {
+              console.log(chalk.yellow(`  Would prune branch ${branch}`));
+            }
+            for (const { branch, error } of prune.errors) {
+              console.error(chalk.red(`  Error checking branch ${branch}: ${error}`));
+            }
+          }
+        }
       } else {
         const result = await sm.cleanup(opts.project);
 
@@ -147,6 +295,23 @@ export function registerSession(program: Command): void {
             }
           }
           console.log(chalk.green(`\nCleanup complete. ${result.killed.length} sessions cleaned.`));
+        }
+
+        if (shouldPruneBranches) {
+          const prune = await pruneSessionBranches(opts.project, false);
+          if (prune.deleted.length > 0) {
+            for (const branch of prune.deleted) {
+              console.log(chalk.green(`  Pruned branch: ${branch}`));
+            }
+          }
+          if (prune.errors.length > 0) {
+            for (const { branch, error } of prune.errors) {
+              console.error(chalk.red(`  Error pruning branch ${branch}: ${error}`));
+            }
+          }
+          if (prune.deleted.length === 0 && prune.errors.length === 0) {
+            console.log(chalk.dim("  No session branches to prune."));
+          }
         }
       }
     });

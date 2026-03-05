@@ -398,4 +398,37 @@ describe("Config Defaults", () => {
     const validated = validateConfig(config);
     expect(validated.projects.proj1.tracker).toEqual({ plugin: "github" });
   });
+
+  it("defaults cleanup.pruneBranches to false", () => {
+    const config = {
+      projects: {
+        proj1: {
+          path: "/repos/test",
+          repo: "org/test",
+          defaultBranch: "main",
+        },
+      },
+    };
+
+    const validated = validateConfig(config);
+    expect(validated.cleanup?.pruneBranches).toBe(false);
+  });
+
+  it("accepts cleanup.pruneBranches override", () => {
+    const config = {
+      cleanup: {
+        pruneBranches: true,
+      },
+      projects: {
+        proj1: {
+          path: "/repos/test",
+          repo: "org/test",
+          defaultBranch: "main",
+        },
+      },
+    };
+
+    const validated = validateConfig(config);
+    expect(validated.cleanup?.pruneBranches).toBe(true);
+  });
 });

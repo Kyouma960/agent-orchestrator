@@ -820,6 +820,9 @@ export interface OrchestratorConfig {
   /** Milliseconds before a "ready" session becomes "idle" (default: 300000 = 5 min) */
   readyThresholdMs: number;
 
+  /** Session cleanup behavior */
+  cleanup?: CleanupConfig;
+
   /** Default plugin selections */
   defaults: DefaultPlugins;
 
@@ -834,6 +837,11 @@ export interface OrchestratorConfig {
 
   /** Default reaction configs */
   reactions: Record<string, ReactionConfig>;
+}
+
+export interface CleanupConfig {
+  /** Also prune safe archived session branches during `ao session cleanup` */
+  pruneBranches: boolean;
 }
 
 export interface DefaultPlugins {

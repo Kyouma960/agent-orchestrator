@@ -417,4 +417,99 @@ describe("session cleanup", () => {
     const output = consoleSpy.mock.calls.map((c) => String(c[0])).join("\n");
     expect(output).toContain("No sessions to clean up");
   });
+
+  it("prunes safe archived session branches when enabled", async () => {
+    const archiveDir = join(sessionsDir, "archive");
+    mkdirSync(archiveDir, { recursive: true });
+    writeFileSync(join(archiveDir, "app-1_2026-03-05T10-00-00-000Z"), "status=killed\n");
+
+    mockSessionManager.cleanup.mockResolvedValue({
+      killed: [],
+      skipped: [],
+      errors: [],
+    } satisfies CleanupResult);
+    mockSessionManager.list.mockResolvedValue([]);
+
+    mockGit.mockImplementation(async (args: string[]) => {
+      if (args[0] === "for-each-ref") return "session/app-1\nsession/app-2";
+      if (args[0] === "branch" && args[2] === "--merged") return "session/app-1";
+      if (args[0] === "worktree") return "";
+      if (args[0] === "branch" && args[1] === "-d" && args[2] === "session/app-1") return "deleted";
+      return null;
+    });
+
+    await program.parseAsync(["node", "test", "session", "cleanup", "--prune-branches"]);
+
+    const output = consoleSpy.mock.calls.map((c) => String(c[0])).join("\n");
+    expect(output).toContain("Pruned branch: session/app-1");
+    expect(mockGit).toHaveBeenCalledWith(["branch", "-d", "session/app-1"], expect.any(String));
+  });
+
+  it("prunes safe archived session branches when config cleanup.pruneBranches is true", async () => {
+    const archiveDir = join(sessionsDir, "archive");
+    mkdirSync(archiveDir, { recursive: true });
+    writeFileSync(join(archiveDir, "app-1_2026-03-05T10-00-00-000Z"), "status=killed\n");
+
+    mockConfigRef.current = {
+      ...(mockConfigRef.current ?? {}),
+      cleanup: {
+        pruneBranches: true,
+      },
+    };
+
+    mockSessionManager.cleanup.mockResolvedValue({
+      killed: [],
+      skipped: [],
+      errors: [],
+    } satisfies CleanupResult);
+    mockSessionManager.list.mockResolvedValue([]);
+
+    mockGit.mockImplementation(async (args: string[]) => {
+      if (args[0] === "for-each-ref") return "session/app-1";
+      if (args[0] === "branch" && args[2] === "--merged") return "session/app-1";
+      if (args[0] === "worktree") return "";
+      if (args[0] === "branch" && args[1] === "-d" && args[2] === "session/app-1") return "deleted";
+      return null;
+    });
+
+    await program.parseAsync(["node", "test", "session", "cleanup"]);
+
+    const output = consoleSpy.mock.calls.map((c) => String(c[0])).join("\n");
+    expect(output).toContain("Pruned branch: session/app-1");
+    expect(mockGit).toHaveBeenCalledWith(["branch", "-d", "session/app-1"], expect.any(String));
+  });
+
+  it("does not delete branches in prune dry-run", async () => {
+    const archiveDir = join(sessionsDir, "archive");
+    mkdirSync(archiveDir, { recursive: true });
+    writeFileSync(join(archiveDir, "app-1_2026-03-05T10-00-00-000Z"), "status=killed\n");
+
+    mockSessionManager.cleanup.mockResolvedValue({
+      killed: [],
+      skipped: [],
+      errors: [],
+    } satisfies CleanupResult);
+    mockSessionManager.list.mockResolvedValue([]);
+
+    mockGit.mockImplementation(async (args: string[]) => {
+      if (args[0] === "for-each-ref") return "session/app-1";
+      if (args[0] === "branch" && args[2] === "--merged") return "session/app-1";
+      if (args[0] === "worktree") return "";
+      if (args[0] === "branch" && args[1] === "-d") return "deleted";
+      return null;
+    });
+
+    await program.parseAsync([
+      "node",
+      "test",
+      "session",
+      "cleanup",
+      "--dry-run",
+      "--prune-branches",
+    ]);
+
+    const output = consoleSpy.mock.calls.map((c) => String(c[0])).join("\n");
+    expect(output).toContain("Would prune branch session/app-1");
+    expect(mockGit).not.toHaveBeenCalledWith(["branch", "-d", "session/app-1"], expect.any(String));
+  });
 });
