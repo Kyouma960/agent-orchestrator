@@ -91,7 +91,7 @@ This document defines intended behavior for Agent Orchestrator when `agent: open
 - OpenCode binary missing: OpenCode-specific operations relying on `opencode session ...` discovery/deletion degrade gracefully where coded (discovery returns none), and explicit operations report mapping/deletion errors when required.
 - Corrupted `runtimeHandle` metadata: `send` fails with `Corrupted runtime handle`.
 - Existing orchestrator metadata present but runtime dead under `reuse`: restart runtime and pass mapped `opencodeSessionId` when available.
-- Duplicate OpenCode sessions with same AO title: newest by `updated` timestamp is selected for remap/discovery.
+- Duplicate OpenCode sessions with same AO title: title match drives selection for remap/discovery (no timestamp ranking).
 - Archived OpenCode sessions already cleaned: `cleanup` skips duplicate deletion via `opencodeCleanedAt`.
 - Unknown project/agent: fail fast with clear error.
 
