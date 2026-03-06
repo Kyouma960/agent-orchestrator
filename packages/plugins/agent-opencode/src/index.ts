@@ -92,10 +92,6 @@ function createOpenCodeAgent(): Agent {
         promptValue = shellEscape(config.systemPrompt);
       }
 
-      if (promptValue) {
-        options.push("--prompt", promptValue);
-      }
-
       if (config.model) {
         sharedOptions.push("--model", shellEscape(config.model));
       }
@@ -110,6 +106,10 @@ function createOpenCodeAgent(): Agent {
           " ",
         );
         return `${runCommand} && exec ${continueCommand}`;
+      }
+
+      if (promptValue) {
+        options.push("--prompt", promptValue);
       }
 
       options.push(...sharedOptions);

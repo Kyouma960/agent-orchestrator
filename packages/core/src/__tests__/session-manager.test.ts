@@ -2279,6 +2279,7 @@ describe("spawnOrchestrator", () => {
     const deleteLogPath = join(tmpDir, "opencode-delete-orchestrator-reuse-title.log");
     const mockBin = installMockOpencode(
       JSON.stringify([
+        null,
         { id: "ses_title_match", title: "AO:app-orchestrator", updated: 1_772_777_000_000 },
       ]),
       deleteLogPath,

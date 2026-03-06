@@ -109,6 +109,7 @@ async function discoverOpenCodeSessionIdsByTitle(
     if (!Array.isArray(parsed)) return [];
     const title = `AO:${sessionId}`;
     const candidates = parsed.filter((entry) => {
+      if (!entry || typeof entry !== "object") return false;
       const candidateTitle = typeof entry["title"] === "string" ? entry["title"] : "";
       const candidateId = typeof entry["id"] === "string" ? entry["id"] : "";
       return candidateTitle === title && candidateId.length > 0;
