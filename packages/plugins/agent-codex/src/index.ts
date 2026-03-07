@@ -571,6 +571,9 @@ function createCodexAgent(): Agent {
       const binary = resolvedBinary ?? "codex";
       const parts: string[] = [shellEscape(binary)];
 
+      // Disable update check prompt for non-interactive AO sessions
+      parts.push("-c", "check_for_update_on_startup=false");
+
       appendApprovalFlags(parts, config.permissions as string | undefined);
       appendModelFlags(parts, config.model);
 
@@ -603,8 +606,6 @@ function createCodexAgent(): Agent {
       // The wrappers strip this directory from PATH before calling the real
       // binary, so there's no infinite recursion.
       env["PATH"] = `${AO_BIN_DIR}:${process.env["PATH"] ?? "/usr/bin:/bin"}`;
-      // Disable Codex's version check/update prompt for non-interactive AO sessions.
-      env["CODEX_DISABLE_UPDATE_CHECK"] = "1";
 
       return env;
     },
@@ -761,6 +762,9 @@ function createCodexAgent(): Agent {
       // Flags are placed before the positional threadId for CLI parser compatibility.
       const binary = resolvedBinary ?? "codex";
       const parts: string[] = [shellEscape(binary), "resume"];
+
+      // Disable update check prompt for non-interactive AO sessions
+      parts.push("-c", "check_for_update_on_startup=false");
 
       appendApprovalFlags(parts, project.agentConfig?.permissions as string | undefined);
       const effectiveModel = (project.agentConfig?.model ?? data.model) as string | undefined;
