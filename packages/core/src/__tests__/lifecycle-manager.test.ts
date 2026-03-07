@@ -111,11 +111,8 @@ beforeEach(() => {
     kill: vi.fn().mockResolvedValue(undefined),
     cleanup: vi.fn(),
     send: vi.fn().mockResolvedValue(undefined),
-<<<<<<< HEAD
     remap: vi.fn(),
-=======
     claimPR: vi.fn(),
->>>>>>> origin/main
   };
 
   config = {
@@ -974,10 +971,7 @@ describe("reactions", () => {
     await lm.check("app-1");
 
     expect(mockSessionManager.send).toHaveBeenCalledTimes(1);
-    expect(mockSessionManager.send).toHaveBeenCalledWith(
-      "app-1",
-      "Handle requested changes.",
-    );
+    expect(mockSessionManager.send).toHaveBeenCalledWith("app-1", "Handle requested changes.");
   });
 
   it("dispatches automated review comments only once for an unchanged backlog", async () => {
