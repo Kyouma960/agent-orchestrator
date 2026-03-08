@@ -11,11 +11,12 @@
  * Reference: scripts/claude-ao-session, scripts/send-to-session
  */
 
-import { statSync, existsSync, readdirSync, writeFileSync, mkdirSync } from "node:fs";
+import { statSync, existsSync, readdirSync, writeFileSync, mkdirSync, unlinkSync, rmSync } from "node:fs";
 import { execFile } from "node:child_process";
 import { basename, join, resolve } from "node:path";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { promisify } from "node:util";
+import { shellEscape } from "./utils.js";
 import {
   isIssueNotFoundError,
   isRestorable,
@@ -28,6 +29,7 @@ import {
   type SessionId,
   type SessionSpawnConfig,
   type OrchestratorSpawnConfig,
+  type ProjectSpawnConfig,
   type SessionStatus,
   type CleanupResult,
   type ClaimPROptions,
@@ -42,6 +44,9 @@ import {
   type PluginRegistry,
   type RuntimeHandle,
   type Issue,
+  type TrackerProject,
+  type ParallelProjectResult,
+  type MergeProjectResult,
   PR_STATE,
 } from "./types.js";
 import {
@@ -54,7 +59,7 @@ import {
   listMetadata,
   reserveSessionId,
 } from "./metadata.js";
-import { buildPrompt } from "./prompt-builder.js";
+import { buildPrompt, buildProjectPrompt, buildParallelAgentPrompt } from "./prompt-builder.js";
 import {
   getSessionsDir,
   getWorktreesDir,
@@ -952,6 +957,487 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
       } catch {
         // Non-fatal: agent is running but didn't receive the initial prompt.
         // User can retry with `ao send`.
+      }
+    }
+
+    return session;
+  }
+
+  /**
+   * Resolve issues for a project-mode spawn (shared by sequential and parallel).
+   */
+  async function resolveProjectIssues(
+    spawnConfig: ProjectSpawnConfig,
+    project: ProjectConfig,
+    plugins: { tracker?: Tracker | null },
+  ): Promise<{ issues: Issue[]; trackerProject?: TrackerProject; trackerProjectId?: string }> {
+    let issues: Issue[] = [];
+    let trackerProject: TrackerProject | undefined;
+    let trackerProjectId: string | undefined;
+
+    if (spawnConfig.trackerProjectId && plugins.tracker?.getTrackerProject && plugins.tracker?.listProjectIssues) {
+      trackerProject = await plugins.tracker.getTrackerProject(spawnConfig.trackerProjectId, project);
+      issues = await plugins.tracker.listProjectIssues(spawnConfig.trackerProjectId, project);
+      trackerProjectId = trackerProject.id;
+      if (issues.length === 0) {
+        throw new Error(`No open issues found in tracker project "${trackerProject.name}"`);
+      }
+    } else if (spawnConfig.issueIds && spawnConfig.issueIds.length > 0) {
+      if (!plugins.tracker) {
+        throw new Error("Tracker plugin required to resolve issue IDs");
+      }
+      for (const issueId of spawnConfig.issueIds) {
+        const issue = await plugins.tracker.getIssue(issueId, project);
+        issues.push(issue);
+      }
+    } else if (spawnConfig.trackerProjectId) {
+      throw new Error("Tracker plugin does not support project queries (getTrackerProject/listProjectIssues)");
+    }
+
+    return { issues, trackerProject, trackerProjectId };
+  }
+
+  /**
+   * Determine the project branch name from config or defaults.
+   */
+  function resolveProjectBranch(
+    spawnConfig: ProjectSpawnConfig,
+    trackerProject?: TrackerProject,
+    issues?: Issue[],
+  ): string {
+    if (spawnConfig.branch) return spawnConfig.branch;
+    if (trackerProject) {
+      const slug = trackerProject.name
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, "-")
+        .slice(0, 60)
+        .replace(/^-+|-+$/g, "");
+      return `project/${slug}`;
+    }
+    if (issues && issues.length > 0) {
+      const firstId = issues[0].id;
+      const prefix = firstId.includes("-")
+        ? firstId.split("-")[0].toLowerCase()
+        : firstId.toLowerCase();
+      return `project/${prefix}-batch`;
+    }
+    return `project/batch`;
+  }
+
+  /**
+   * Parallel project mode: spawn one agent per issue, each on its own branch.
+   * Agents commit locally but do NOT push or create PRs. Use mergeProject() to combine and push.
+   */
+  async function spawnParallelProject(spawnConfig: ProjectSpawnConfig): Promise<ParallelProjectResult> {
+    const project = config.projects[spawnConfig.projectId];
+    if (!project) throw new Error(`Unknown project: ${spawnConfig.projectId}`);
+
+    const plugins = resolvePlugins(project);
+    if (!plugins.runtime) {
+      throw new Error(`Runtime plugin '${project.runtime ?? config.defaults.runtime}' not found`);
+    }
+    if (spawnConfig.agent) {
+      const overrideAgent = registry.get<Agent>("agent", spawnConfig.agent);
+      if (!overrideAgent) throw new Error(`Agent plugin '${spawnConfig.agent}' not found`);
+      plugins.agent = overrideAgent;
+    }
+    if (!plugins.agent) {
+      throw new Error(`Agent plugin '${project.agent ?? config.defaults.agent}' not found`);
+    }
+
+    const { issues, trackerProject } = await resolveProjectIssues(spawnConfig, project, plugins);
+    const projectBranch = resolveProjectBranch(spawnConfig, trackerProject, issues);
+    const groupId = `pg-${Date.now().toString(36)}`;
+    const sessions: Session[] = [];
+
+    const spawnErrors: Array<{ issueId: string; error: string }> = [];
+
+    for (const issue of issues) {
+      // Use "--" separator (not "/") to avoid git ref D/F conflicts.
+      // Git cannot have both refs/heads/project/foo (file) and
+      // refs/heads/project/foo/bar (directory) — "/" would make the
+      // project branch a prefix of agent branches, causing mergeProject to fail.
+      const agentBranch = `${projectBranch}--${issue.id.toLowerCase()}`;
+
+      try {
+        // Spawn each issue as a normal session, but with a custom prompt (no PR)
+        const sessionsDir = getProjectSessionsDir(project);
+        if (config.configPath) {
+          validateAndStoreOrigin(config.configPath, project.path);
+        }
+
+        const existingSessions = listMetadata(sessionsDir);
+        let num = getNextSessionNumber(existingSessions, project.sessionPrefix);
+        let sessionId!: string;
+        let tmuxName: string | undefined;
+        for (let attempts = 0; attempts < 10; attempts++) {
+          sessionId = `${project.sessionPrefix}-${num}`;
+          if (config.configPath) {
+            tmuxName = generateTmuxName(config.configPath, project.sessionPrefix, num);
+          }
+          if (reserveSessionId(sessionsDir, sessionId)) break;
+          num++;
+          if (attempts === 9) {
+            throw new Error(`Failed to reserve session ID after 10 attempts`);
+          }
+        }
+        sessionId = `${project.sessionPrefix}-${num}`;
+        if (config.configPath) {
+          tmuxName = generateTmuxName(config.configPath, project.sessionPrefix, num);
+        }
+
+        // Create workspace
+        let workspacePath = project.path;
+        if (plugins.workspace) {
+          try {
+            const wsInfo = await plugins.workspace.create({
+              projectId: spawnConfig.projectId,
+              project,
+              sessionId,
+              branch: agentBranch,
+            });
+            workspacePath = wsInfo.path;
+            if (plugins.workspace.postCreate) {
+              try {
+                await plugins.workspace.postCreate(wsInfo, project);
+              } catch (err) {
+                if (shouldDestroyWorkspacePath(project, spawnConfig.projectId, workspacePath)) {
+                  try { await plugins.workspace.destroy(workspacePath); } catch { /* */ }
+                }
+                throw err;
+              }
+            }
+          } catch (err) {
+            try { deleteMetadata(sessionsDir, sessionId, false); } catch { /* */ }
+            throw err;
+          }
+        }
+
+        // Build parallel agent prompt (no PR creation)
+        const composedPrompt = buildParallelAgentPrompt({
+          project,
+          projectId: spawnConfig.projectId,
+          issue,
+          projectBranch,
+          totalIssues: issues.length,
+        });
+
+        const agentLaunchConfig = {
+          sessionId,
+          projectConfig: project,
+          prompt: composedPrompt,
+          permissions: project.agentConfig?.permissions,
+          model: project.agentConfig?.model,
+        };
+
+        let handle: RuntimeHandle;
+        try {
+          const launchCommand = plugins.agent.getLaunchCommand(agentLaunchConfig);
+          const environment = plugins.agent.getEnvironment(agentLaunchConfig);
+          handle = await plugins.runtime.create({
+            sessionId: tmuxName ?? sessionId,
+            workspacePath,
+            launchCommand,
+            environment: {
+              ...environment,
+              AO_SESSION: sessionId,
+              AO_DATA_DIR: sessionsDir,
+              AO_SESSION_NAME: sessionId,
+              ...(tmuxName && { AO_TMUX_NAME: tmuxName }),
+            },
+          });
+        } catch (err) {
+          if (plugins.workspace && shouldDestroyWorkspacePath(project, spawnConfig.projectId, workspacePath)) {
+            try { await plugins.workspace.destroy(workspacePath); } catch { /* */ }
+          }
+          try { deleteMetadata(sessionsDir, sessionId, false); } catch { /* */ }
+          throw err;
+        }
+
+        const session: Session = {
+          id: sessionId,
+          projectId: spawnConfig.projectId,
+          status: "spawning",
+          activity: "active",
+          branch: agentBranch,
+          issueId: issue.id,
+          pr: null,
+          workspacePath,
+          runtimeHandle: handle,
+          agentInfo: null,
+          createdAt: new Date(),
+          lastActivityAt: new Date(),
+          metadata: {},
+        };
+
+        writeMetadata(sessionsDir, sessionId, {
+          worktree: workspacePath,
+          branch: agentBranch,
+          status: "spawning",
+          tmuxName,
+          issue: issue.id,
+          project: spawnConfig.projectId,
+          agent: plugins.agent.name,
+          parallelGroupId: groupId,
+          parallelProjectBranch: projectBranch,
+          prAutoDetect: "off", // Prevent lifecycle from expecting a PR
+          createdAt: new Date().toISOString(),
+          runtimeHandle: JSON.stringify(handle),
+        });
+
+        if (plugins.agent.postLaunchSetup) {
+          await plugins.agent.postLaunchSetup(session);
+        }
+
+        // Send prompt post-launch if needed
+        if (plugins.agent.promptDelivery === "post-launch" && composedPrompt) {
+          try {
+            await new Promise((resolve) => setTimeout(resolve, 5_000));
+            await plugins.runtime.sendMessage(handle, composedPrompt);
+          } catch {
+            // Non-fatal
+          }
+        }
+
+        sessions.push(session);
+      } catch (err) {
+        // Record failure but continue spawning remaining issues.
+        // Already-spawned sessions are running and have the groupId in metadata.
+        spawnErrors.push({
+          issueId: issue.id,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+
+    if (sessions.length === 0) {
+      const details = spawnErrors.map((e) => `${e.issueId}: ${e.error}`).join("; ");
+      throw new Error(`All parallel sessions failed to spawn: ${details}`);
+    }
+
+    return {
+      projectBranch,
+      sessions,
+      trackerProject,
+      groupId,
+      failedIssues: spawnErrors.length > 0 ? spawnErrors : undefined,
+    };
+  }
+
+  async function spawnProject(spawnConfig: ProjectSpawnConfig): Promise<Session | ParallelProjectResult> {
+    if (!spawnConfig.trackerProjectId && (!spawnConfig.issueIds || spawnConfig.issueIds.length === 0)) {
+      throw new Error("spawnProject requires either trackerProjectId or issueIds");
+    }
+
+    // Parallel mode: delegate to spawnParallelProject
+    if (spawnConfig.parallel) {
+      return spawnParallelProject(spawnConfig);
+    }
+
+    const project = config.projects[spawnConfig.projectId];
+    if (!project) {
+      throw new Error(`Unknown project: ${spawnConfig.projectId}`);
+    }
+
+    const plugins = resolvePlugins(project);
+    if (!plugins.runtime) {
+      throw new Error(`Runtime plugin '${project.runtime ?? config.defaults.runtime}' not found`);
+    }
+    if (spawnConfig.agent) {
+      const overrideAgent = registry.get<Agent>("agent", spawnConfig.agent);
+      if (!overrideAgent) {
+        throw new Error(`Agent plugin '${spawnConfig.agent}' not found`);
+      }
+      plugins.agent = overrideAgent;
+    }
+    if (!plugins.agent) {
+      throw new Error(`Agent plugin '${project.agent ?? config.defaults.agent}' not found`);
+    }
+
+    const { issues, trackerProject, trackerProjectId } = await resolveProjectIssues(spawnConfig, project, plugins);
+    const branch = resolveProjectBranch(spawnConfig, trackerProject, issues);
+
+    // Get sessions directory and reserve session ID
+    const sessionsDir = getProjectSessionsDir(project);
+    if (config.configPath) {
+      validateAndStoreOrigin(config.configPath, project.path);
+    }
+
+    const existingSessions = listMetadata(sessionsDir);
+    let num = getNextSessionNumber(existingSessions, project.sessionPrefix);
+    let sessionId: string;
+    let tmuxName: string | undefined;
+    for (let attempts = 0; attempts < 10; attempts++) {
+      sessionId = `${project.sessionPrefix}-${num}`;
+      if (config.configPath) {
+        tmuxName = generateTmuxName(config.configPath, project.sessionPrefix, num);
+      }
+      if (reserveSessionId(sessionsDir, sessionId)) break;
+      num++;
+      if (attempts === 9) {
+        throw new Error(
+          `Failed to reserve session ID after 10 attempts (prefix: ${project.sessionPrefix})`,
+        );
+      }
+    }
+    sessionId = `${project.sessionPrefix}-${num}`;
+    if (config.configPath) {
+      tmuxName = generateTmuxName(config.configPath, project.sessionPrefix, num);
+    }
+
+    // Create workspace
+    let workspacePath = project.path;
+    if (plugins.workspace) {
+      try {
+        const wsInfo = await plugins.workspace.create({
+          projectId: spawnConfig.projectId,
+          project,
+          sessionId,
+          branch,
+        });
+        workspacePath = wsInfo.path;
+
+        if (plugins.workspace.postCreate) {
+          try {
+            await plugins.workspace.postCreate(wsInfo, project);
+          } catch (err) {
+            if (shouldDestroyWorkspacePath(project, spawnConfig.projectId, workspacePath)) {
+              try {
+                await plugins.workspace.destroy(workspacePath);
+              } catch {
+                /* best effort */
+              }
+            }
+            throw err;
+          }
+        }
+      } catch (err) {
+        try {
+          deleteMetadata(sessionsDir, sessionId, false);
+        } catch {
+          /* best effort */
+        }
+        throw err;
+      }
+    }
+
+    // Generate project-mode prompt
+    const composedPrompt = buildProjectPrompt({
+      project,
+      projectId: spawnConfig.projectId,
+      trackerProject,
+      issues,
+    });
+
+    // Create runtime
+    const agentLaunchConfig = {
+      sessionId,
+      projectConfig: project,
+      prompt: composedPrompt,
+      permissions: project.agentConfig?.permissions,
+      model: project.agentConfig?.model,
+    };
+
+    let handle: RuntimeHandle;
+    try {
+      const launchCommand = plugins.agent.getLaunchCommand(agentLaunchConfig);
+      const environment = plugins.agent.getEnvironment(agentLaunchConfig);
+
+      handle = await plugins.runtime.create({
+        sessionId: tmuxName ?? sessionId,
+        workspacePath,
+        launchCommand,
+        environment: {
+          ...environment,
+          AO_SESSION: sessionId,
+          AO_DATA_DIR: sessionsDir,
+          AO_SESSION_NAME: sessionId,
+          ...(tmuxName && { AO_TMUX_NAME: tmuxName }),
+        },
+      });
+    } catch (err) {
+      if (
+        plugins.workspace &&
+        shouldDestroyWorkspacePath(project, spawnConfig.projectId, workspacePath)
+      ) {
+        try {
+          await plugins.workspace.destroy(workspacePath);
+        } catch {
+          /* best effort */
+        }
+      }
+      try {
+        deleteMetadata(sessionsDir, sessionId, false);
+      } catch {
+        /* best effort */
+      }
+      throw err;
+    }
+
+    // Write metadata
+    const session: Session = {
+      id: sessionId,
+      projectId: spawnConfig.projectId,
+      status: "spawning",
+      activity: "active",
+      branch,
+      issueId: null, // Project-mode: no single issue
+      pr: null,
+      workspacePath,
+      runtimeHandle: handle,
+      agentInfo: null,
+      createdAt: new Date(),
+      lastActivityAt: new Date(),
+      metadata: {},
+    };
+
+    try {
+      writeMetadata(sessionsDir, sessionId, {
+        worktree: workspacePath,
+        branch,
+        status: "spawning",
+        tmuxName,
+        project: spawnConfig.projectId,
+        agent: plugins.agent.name,
+        trackerProjectId,
+        createdAt: new Date().toISOString(),
+        runtimeHandle: JSON.stringify(handle),
+      });
+
+      if (plugins.agent.postLaunchSetup) {
+        await plugins.agent.postLaunchSetup(session);
+      }
+    } catch (err) {
+      try {
+        await plugins.runtime.destroy(handle);
+      } catch {
+        /* best effort */
+      }
+      if (
+        plugins.workspace &&
+        shouldDestroyWorkspacePath(project, spawnConfig.projectId, workspacePath)
+      ) {
+        try {
+          await plugins.workspace.destroy(workspacePath);
+        } catch {
+          /* best effort */
+        }
+      }
+      try {
+        deleteMetadata(sessionsDir, sessionId, false);
+      } catch {
+        /* best effort */
+      }
+      throw err;
+    }
+
+    // Send prompt post-launch if needed
+    if (plugins.agent.promptDelivery === "post-launch" && agentLaunchConfig.prompt) {
+      try {
+        await new Promise((resolve) => setTimeout(resolve, 5_000));
+        await plugins.runtime.sendMessage(handle, agentLaunchConfig.prompt);
+      } catch {
+        // Non-fatal: user can retry with `ao send`
       }
     }
 
@@ -2030,5 +2516,232 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
     return restoredSession;
   }
 
-  return { spawn, spawnOrchestrator, restore, list, get, kill, cleanup, send, claimPR, remap };
+  /**
+   * Merge all branches from a parallel project group into one branch and create a PR.
+   * Reads session metadata to find sessions with matching parallelGroupId.
+   */
+  async function mergeProject(groupId: string): Promise<MergeProjectResult> {
+    // list() reads metadata + enriches with runtime state (activity, liveness).
+    // session.metadata contains the raw metadata map including parallelGroupId.
+    const allSessions = await list();
+    const groupSessions: Array<{
+      session: Session;
+      meta: { branch: string; issue?: string; parallelProjectBranch?: string; pr?: string };
+    }> = [];
+
+    for (const session of allSessions) {
+      const meta = session.metadata;
+      if (meta["parallelGroupId"] === groupId) {
+        groupSessions.push({
+          session,
+          meta: {
+            branch: meta["branch"] ?? "",
+            issue: meta["issue"],
+            parallelProjectBranch: meta["parallelProjectBranch"],
+            pr: meta["pr"],
+          },
+        });
+      }
+    }
+
+    if (groupSessions.length === 0) {
+      throw new Error(`No sessions found for parallel group: ${groupId}`);
+    }
+
+    const projectBranch = groupSessions[0].meta.parallelProjectBranch;
+    if (!projectBranch) {
+      throw new Error("Parallel project sessions missing project branch metadata");
+    }
+
+    const projectConfig = config.projects[groupSessions[0].session.projectId];
+    if (!projectConfig) {
+      throw new Error(`Project not found: ${groupSessions[0].session.projectId}`);
+    }
+
+    const result: MergeProjectResult = {
+      projectBranch,
+      merged: [],
+      conflicts: [],
+      notReady: [],
+      prUrl: null,
+      closedPRs: [],
+    };
+
+    // Classify sessions by readiness.
+    // For parallel sessions, "killed" is the normal end state — agent finished,
+    // tmux exited. The branch verification step below confirms actual work was pushed.
+    const readySessions: typeof groupSessions = [];
+    const doneStatuses = new Set([
+      "killed", "done", "merged",            // agent finished (parallel sessions end as "killed")
+      "pr_open", "approved", "mergeable",     // has a PR (shouldn't happen with prAutoDetect: off, but handle it)
+      "review_pending",
+    ]);
+    const doneActivities = new Set(["exited", "ready", "idle"]);
+
+    for (const gs of groupSessions) {
+      const s = gs.session;
+      const isDone = doneStatuses.has(s.status) ||
+        (s.activity !== null && doneActivities.has(s.activity));
+      if (isDone) {
+        readySessions.push(gs);
+      } else {
+        result.notReady.push({
+          sessionId: s.id,
+          issueId: gs.meta.issue ?? "unknown",
+          status: s.status,
+        });
+      }
+    }
+
+    if (readySessions.length === 0) {
+      return result;
+    }
+
+    // Verify each ready session's branch has local commits.
+    // Parallel agents commit locally (no push), so we check local branch refs.
+    const { execSync } = await import("node:child_process");
+    const gitOpts = { cwd: projectConfig.path, encoding: "utf-8" as const, stdio: "pipe" as const };
+
+    // Fetch origin to have an up-to-date default branch ref for the merge base
+    execSync(`git fetch origin`, gitOpts);
+
+    const verifiedSessions: typeof readySessions = [];
+    for (const gs of readySessions) {
+      try {
+        // Check the branch exists locally (agents commit locally, not to remote)
+        execSync(`git rev-parse --verify ${shellEscape(gs.meta.branch)}`, gitOpts);
+        // Check it has commits beyond the default branch
+        const diffCount = execSync(
+          `git rev-list --count ${shellEscape(`origin/${projectConfig.defaultBranch}`)}..${shellEscape(gs.meta.branch)}`,
+          gitOpts,
+        ).trim();
+        if (parseInt(diffCount, 10) > 0) {
+          verifiedSessions.push(gs);
+        } else {
+          // Branch exists but has no new commits — agent may have crashed before committing
+          result.notReady.push({
+            sessionId: gs.session.id,
+            issueId: gs.meta.issue ?? "unknown",
+            status: `${gs.session.status} (no commits on branch)`,
+          });
+        }
+      } catch {
+        // Branch doesn't exist locally — agent hasn't committed yet
+        result.notReady.push({
+          sessionId: gs.session.id,
+          issueId: gs.meta.issue ?? "unknown",
+          status: `${gs.session.status} (branch not found)`,
+        });
+      }
+    }
+
+    if (verifiedSessions.length === 0) {
+      return result;
+    }
+
+    // Use a temporary worktree for merge operations to avoid touching the user's working tree.
+    const mergeDir = join(tmpdir(), `ao-merge-${groupId}-${Date.now()}`);
+    let worktreeCreated = false;
+
+    try {
+      // Delete local project branch if it exists (doesn't affect working tree or remote)
+      try { execSync(`git branch -D ${shellEscape(projectBranch)}`, gitOpts); } catch { /* */ }
+
+      // Create a temporary worktree with a new project branch based on origin/defaultBranch
+      execSync(
+        `git worktree add ${shellEscape(mergeDir)} -b ${shellEscape(projectBranch)} ${shellEscape(`origin/${projectConfig.defaultBranch}`)}`,
+        gitOpts,
+      );
+      worktreeCreated = true;
+
+      const mergeOpts = { cwd: mergeDir, encoding: "utf-8" as const, stdio: "pipe" as const };
+
+      for (const gs of verifiedSessions) {
+        const branch = gs.meta.branch;
+        const issueId = gs.meta.issue ?? "unknown";
+        try {
+          // Merge from local branch refs (agents commit locally, not to remote)
+          execSync(`git merge ${shellEscape(branch)} --no-edit`, mergeOpts);
+          result.merged.push({ branch, issueId });
+        } catch {
+          try { execSync(`git merge --abort`, mergeOpts); } catch { /* */ }
+          result.conflicts.push({ branch, issueId });
+        }
+      }
+
+      if (result.conflicts.length > 0) {
+        return result;
+      }
+
+      if (result.merged.length > 0) {
+        // Use --force-with-lease for safer pushes (won't overwrite unexpected remote changes)
+        execSync(`git push -u origin ${shellEscape(projectBranch)} --force-with-lease`, mergeOpts);
+
+        // Create combined PR via gh — use a temp file for the body to avoid shell injection
+        const issueList = result.merged.map((m) => `- ${m.issueId}`).join("\n");
+        const prBody = [
+          "## Combined PR — Parallel Project",
+          "",
+          "Issues worked in parallel, combined into one PR.",
+          "",
+          "### Issues",
+          issueList,
+          "",
+          "---",
+          "Generated by `ao merge-project`",
+        ].join("\n");
+        const prTitle = projectBranch.replace("project/", "") + ": combined parallel work";
+
+        const bodyFile = join(mergeDir, ".ao-pr-body.md");
+        writeFileSync(bodyFile, prBody, "utf-8");
+
+        try {
+          const prUrl = execSync(
+            `gh pr create --repo ${shellEscape(projectConfig.repo)} --base ${shellEscape(projectConfig.defaultBranch)} --head ${shellEscape(projectBranch)} --title ${shellEscape(prTitle)} --body-file ${shellEscape(bodyFile)}`,
+            mergeOpts,
+          ).trim();
+          result.prUrl = prUrl;
+        } catch {
+          // PR might already exist
+          try {
+            const existing = execSync(
+              `gh pr view ${shellEscape(projectBranch)} --repo ${shellEscape(projectConfig.repo)} --json url -q .url`,
+              mergeOpts,
+            ).trim();
+            result.prUrl = existing;
+          } catch { /* */ }
+        }
+
+        // Clean up temp body file
+        try { unlinkSync(bodyFile); } catch { /* */ }
+
+        // Close individual agent PRs (if any were created despite prAutoDetect: "off")
+        for (const gs of verifiedSessions) {
+          if (gs.meta.pr && result.prUrl) {
+            const prNumber = gs.meta.pr.match(/\/pull\/(\d+)/)?.[1];
+            if (prNumber) {
+              try {
+                execSync(
+                  `gh pr close ${shellEscape(prNumber)} --repo ${shellEscape(projectConfig.repo)} --comment ${shellEscape(`Superseded by combined PR: ${result.prUrl}`)}`,
+                  mergeOpts,
+                );
+                result.closedPRs.push(parseInt(prNumber, 10));
+              } catch { /* */ }
+            }
+          }
+        }
+      }
+
+      return result;
+    } finally {
+      // Always clean up the temporary worktree
+      if (worktreeCreated) {
+        try { execSync(`git worktree remove ${shellEscape(mergeDir)} --force`, gitOpts); } catch { /* */ }
+      }
+      // Belt-and-suspenders: remove the directory if worktree remove didn't
+      try { rmSync(mergeDir, { recursive: true, force: true }); } catch { /* */ }
+    }
+  }
+
+  return { spawn, spawnProject, spawnOrchestrator, restore, list, get, kill, cleanup, send, claimPR, remap, mergeProject };
 }

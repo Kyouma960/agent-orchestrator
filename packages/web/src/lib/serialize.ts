@@ -21,6 +21,17 @@ import { TTLCache, prCache, prCacheKey, type PREnrichmentData } from "./cache";
 /** Cache for issue titles (5 min TTL — issue titles rarely change) */
 const issueTitleCache = new TTLCache<string>(300_000);
 
+/**
+ * Find the orchestrator session from a list of sessions.
+ * When multiple orchestrator sessions exist (e.g. stale metadata from old configs),
+ * picks the most recently created one.
+ */
+export function findOrchestratorSession(sessions: Session[]): Session | undefined {
+  const orchestrators = sessions.filter((s) => s.id.endsWith("-orchestrator"));
+  if (orchestrators.length <= 1) return orchestrators[0];
+  return orchestrators.sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime())[0];
+}
+
 /** Resolve which project a session belongs to. */
 export function resolveProject(
   core: Session,

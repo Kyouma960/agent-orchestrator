@@ -8,6 +8,7 @@ import {
   enrichSessionPR,
   enrichSessionsMetadata,
   computeStats,
+  findOrchestratorSession,
 } from "@/lib/serialize";
 import { prCache, prCacheKey } from "@/lib/cache";
 import { getProjectName } from "@/lib/project-name";
@@ -28,9 +29,9 @@ export default async function Home() {
     const { config, registry, sessionManager } = await getServices();
     const allSessions = await sessionManager.list();
 
-    // Find the orchestrator session (any session ending with -orchestrator)
-    // Only set orchestratorId if an actual session exists (no fallback)
-    const orchSession = allSessions.find((s) => s.id.endsWith("-orchestrator"));
+    // Find the orchestrator session — prefer the most recently created
+    // when stale metadata from old configs leaves multiple matches.
+    const orchSession = findOrchestratorSession(allSessions);
     if (orchSession) {
       orchestratorId = orchSession.id;
     }

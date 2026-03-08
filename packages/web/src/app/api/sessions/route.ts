@@ -7,6 +7,7 @@ import {
   enrichSessionPR,
   enrichSessionsMetadata,
   computeStats,
+  findOrchestratorSession,
 } from "@/lib/serialize";
 
 const METADATA_ENRICH_TIMEOUT_MS = 3_000;
@@ -40,8 +41,8 @@ export async function GET(request: Request) {
     const { config, registry, sessionManager } = await getServices();
     const coreSessions = await sessionManager.list();
 
-    // Find orchestrator session ID (if running) and expose to clients
-    const orchSession = coreSessions.find((s) => s.id.endsWith("-orchestrator"));
+    // Find orchestrator session ID (if running) — prefer most recent
+    const orchSession = findOrchestratorSession(coreSessions);
     const orchestratorId = orchSession ? orchSession.id : null;
 
     // Filter out orchestrator sessions — they get their own button, not a card

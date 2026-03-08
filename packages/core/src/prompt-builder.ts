@@ -12,7 +12,7 @@
 
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import type { ProjectConfig } from "./types.js";
+import type { ProjectConfig, Issue, TrackerProject, ParallelProjectResult } from "./types.js";
 
 // =============================================================================
 // LAYER 1: BASE AGENT PROMPT
@@ -162,6 +162,163 @@ export function buildPrompt(config: PromptBuildConfig): string {
   // Explicit user prompt (appended last, highest priority)
   if (config.userPrompt) {
     sections.push(`## Additional Instructions\n${config.userPrompt}`);
+  }
+
+  return sections.join("\n\n");
+}
+
+// =============================================================================
+// PROJECT MODE PROMPT
+// =============================================================================
+
+export interface ProjectPromptBuildConfig {
+  project: ProjectConfig;
+  projectId: string;
+  trackerProject?: TrackerProject;
+  issues: Issue[];
+}
+
+const PRIORITY_NAMES: Record<number, string> = {
+  0: "No priority",
+  1: "Urgent",
+  2: "High",
+  3: "Normal",
+  4: "Low",
+};
+
+/**
+ * Compose a prompt for project-mode sessions where multiple tickets
+ * are worked on sequentially, one commit per ticket.
+ */
+export function buildProjectPrompt(config: ProjectPromptBuildConfig): string {
+  const { project, projectId, trackerProject, issues } = config;
+  const userRules = readUserRules(project);
+  const sections: string[] = [];
+
+  // Layer 1: Base prompt
+  sections.push(BASE_AGENT_PROMPT);
+
+  // Layer 2: Project context
+  const contextLines: string[] = [];
+  contextLines.push("## Project Context");
+  contextLines.push(`- Project: ${project.name ?? projectId}`);
+  contextLines.push(`- Repository: ${project.repo}`);
+  contextLines.push(`- Default branch: ${project.defaultBranch}`);
+  if (trackerProject) {
+    contextLines.push(`- Tracker project: ${trackerProject.name} (${trackerProject.url})`);
+  }
+  sections.push(contextLines.join("\n"));
+
+  // Project-mode instructions
+  sections.push(`## Project Mode — Multi-Ticket Session
+
+You have been assigned **${issues.length} tickets** to work through in this session.
+Work them **sequentially** in the order listed below. For each ticket:
+
+1. Implement the changes described in the ticket
+2. Commit with: \`feat(scope): TICKET-ID — short description\`
+3. Move to the next ticket
+
+After completing all tickets:
+- Push the branch
+- Create a single PR covering all the work
+
+If a ticket is blocked (missing context, depends on unmerged work, etc.):
+- Skip it and note the blocker in a comment at the end of your session
+- Continue with the next ticket`);
+
+  // Ticket list
+  const ticketLines: string[] = [];
+  ticketLines.push("## Tickets (in priority order)\n");
+
+  for (let i = 0; i < issues.length; i++) {
+    const issue = issues[i];
+    const priority = issue.priority !== undefined ? PRIORITY_NAMES[issue.priority] ?? `P${issue.priority}` : "";
+    ticketLines.push(`### ${i + 1}. ${issue.id}: ${issue.title}`);
+    ticketLines.push(`- URL: ${issue.url}`);
+    if (priority) ticketLines.push(`- Priority: ${priority}`);
+    if (issue.labels.length > 0) ticketLines.push(`- Labels: ${issue.labels.join(", ")}`);
+    if (issue.description) {
+      ticketLines.push("");
+      ticketLines.push(issue.description);
+    }
+    ticketLines.push("");
+  }
+
+  sections.push(ticketLines.join("\n"));
+
+  // Layer 3: User rules
+  if (userRules) {
+    sections.push(`## Project Rules\n${userRules}`);
+  }
+
+  return sections.join("\n\n");
+}
+
+// =============================================================================
+// PARALLEL PROJECT MODE PROMPT (per-agent)
+// =============================================================================
+
+export interface ParallelAgentPromptConfig {
+  project: ProjectConfig;
+  projectId: string;
+  issue: Issue;
+  projectBranch: string;
+  totalIssues: number;
+}
+
+/**
+ * Compose a prompt for a single agent in parallel project mode.
+ * Key difference from normal spawn: agent must NOT create a PR.
+ * The orchestrator will combine all branches and create one PR.
+ */
+export function buildParallelAgentPrompt(config: ParallelAgentPromptConfig): string {
+  const { project, projectId, issue, projectBranch, totalIssues } = config;
+  const userRules = readUserRules(project);
+  const sections: string[] = [];
+
+  // Modified base prompt — no PR creation, no pushing
+  sections.push(`You are an AI coding agent managed by the Agent Orchestrator (ao).
+
+## Session Lifecycle
+- You are running inside a managed session. Focus on your assigned ticket.
+- **IMPORTANT: Do NOT create a Pull Request and do NOT push to origin.** This is a parallel project session — ${totalIssues} agents are working on related tickets simultaneously. The orchestrator will merge all branches and push the combined result.
+- When you finish your work: commit your changes locally. Then stop. Do NOT run git push.
+- If CI fails, the orchestrator will send you the failures — fix them and commit again.
+
+## Git Workflow
+- You are on a feature branch created for your ticket. Work on it directly.
+- Use conventional commit messages: \`feat(scope): ${issue.id} — description\`
+- Include the ticket ID in every commit message.
+- Commit locally when the implementation is ready. Do NOT push. Do NOT open a PR.`);
+
+  // Project context
+  const contextLines: string[] = [];
+  contextLines.push("## Project Context");
+  contextLines.push(`- Project: ${project.name ?? projectId}`);
+  contextLines.push(`- Repository: ${project.repo}`);
+  contextLines.push(`- Default branch: ${project.defaultBranch}`);
+  contextLines.push(`- Combined PR branch: ${projectBranch} (managed by orchestrator)`);
+  contextLines.push(`- This is ticket ${issue.id} — one of ${totalIssues} being worked in parallel`);
+  sections.push(contextLines.join("\n"));
+
+  // Ticket details
+  const ticketLines: string[] = [];
+  ticketLines.push("## Your Ticket\n");
+  ticketLines.push(`**${issue.id}: ${issue.title}**`);
+  ticketLines.push(`- URL: ${issue.url}`);
+  const priority = issue.priority !== undefined ? PRIORITY_NAMES[issue.priority] ?? `P${issue.priority}` : "";
+  if (priority) ticketLines.push(`- Priority: ${priority}`);
+  if (issue.labels.length > 0) ticketLines.push(`- Labels: ${issue.labels.join(", ")}`);
+  if (issue.description) {
+    ticketLines.push("");
+    ticketLines.push(issue.description);
+  }
+  sections.push(ticketLines.join("\n"));
+
+  // User rules
+  if (userRules) {
+    sections.push(`## Project Rules\n${userRules}`);
   }
 
   return sections.join("\n\n");
