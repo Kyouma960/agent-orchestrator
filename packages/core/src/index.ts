@@ -52,8 +52,8 @@ export { createLifecycleManager } from "./lifecycle-manager.js";
 export type { LifecycleManagerDeps } from "./lifecycle-manager.js";
 
 // Prompt builder — layered prompt composition
-export { buildPrompt, BASE_AGENT_PROMPT } from "./prompt-builder.js";
-export type { PromptBuildConfig } from "./prompt-builder.js";
+export { buildPrompt, buildProjectPrompt, buildParallelAgentPrompt, BASE_AGENT_PROMPT } from "./prompt-builder.js";
+export type { PromptBuildConfig, ProjectPromptBuildConfig, ParallelAgentPromptConfig } from "./prompt-builder.js";
 
 // Orchestrator prompt — generates orchestrator context for `ao start`
 export { generateOrchestratorPrompt } from "./orchestrator-prompt.js";

@@ -86,6 +86,7 @@ const mockSessionManager: SessionManager = {
     }
   }),
   cleanup: vi.fn(async () => ({ killed: [], skipped: [], errors: [] })),
+  spawnProject: vi.fn(),
   spawnOrchestrator: vi.fn(),
   remap: vi.fn(async () => "ses_mock"),
   restore: vi.fn(async (id: string) => {

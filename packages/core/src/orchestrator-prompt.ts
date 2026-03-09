@@ -51,6 +51,15 @@ ao spawn ${projectId} INT-1234
 ao spawn ${projectId} --claim-pr 123 --takeover
 ao batch-spawn ${projectId} INT-1 INT-2 INT-3
 
+# Spawn a project-mode session (one branch, all tickets as commits)
+ao spawn-project ${projectId} <linear-project-id>
+ao spawn-project ${projectId} --issues INT-1 INT-2 INT-3
+
+# Parallel project: one agent per issue, merge into one PR when done
+ao spawn-project ${projectId} --parallel <linear-project-id>
+ao spawn-project ${projectId} --parallel --issues INT-1 INT-2 INT-3
+ao merge-project <group-id>   # combine branches + create PR
+
 # List sessions
 ao session ls -p ${projectId}
 
@@ -75,6 +84,9 @@ ao open ${projectId}
 | \`ao status\` | Show all sessions with PR/CI/review status |
 | \`ao spawn <project> [issue] [--claim-pr <pr>]\` | Spawn a worker session, optionally attached to an existing PR |
 | \`ao batch-spawn <project> <issues...>\` | Spawn multiple sessions in parallel |
+| \`ao spawn-project <project> [tracker-project] [--issues ...]\` | Spawn project-mode session (one branch, tickets as commits) |
+| \`ao spawn-project <project> --parallel [tracker-project] [--issues ...]\` | Parallel project: one agent per issue, merge later |
+| \`ao merge-project <group-id>\` | Merge parallel project branches into one PR |
 | \`ao session ls [-p project]\` | List all sessions (optionally filter by project) |
 | \`ao session claim-pr <pr> [session]\` | Attach an existing PR to a session |
 | \`ao session attach <session>\` | Attach to a session's tmux window |

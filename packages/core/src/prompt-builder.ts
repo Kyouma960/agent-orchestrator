@@ -290,7 +290,16 @@ export function buildParallelAgentPrompt(config: ParallelAgentPromptConfig): str
 - You are on a feature branch created for your ticket. Work on it directly.
 - Use conventional commit messages: \`feat(scope): ${issue.id} — description\`
 - Include the ticket ID in every commit message.
-- Commit locally when the implementation is ready. Do NOT push. Do NOT open a PR.`);
+- Commit locally when the implementation is ready. Do NOT push. Do NOT open a PR.
+
+## Parallel Coordination — Shared File Rules
+${totalIssues} agents are editing the codebase simultaneously. Their branches will be merged later. To avoid merge conflicts:
+
+1. **Minimize changes to shared files** — barrel exports (index.ts), type unions, registries, and config files are edited by ALL agents. Make only the minimal additions needed for your ticket.
+2. **Use additive-only changes** — When adding to union types, arrays, or object literals, append your entries at the END. Never reorder existing entries.
+3. **Don't refactor shared code** — Only touch code directly related to your ticket. Don't rename, restructure, or "improve" existing code that other agents depend on.
+4. **Consistent naming** — Use the exact type/variable/export names described in your ticket. Don't invent alternatives that other agents won't expect.
+5. **Self-contained modules** — Put your implementation in its own directory/files. Only touch shared files to register/export your new code.`);
 
   // Project context
   const contextLines: string[] = [];

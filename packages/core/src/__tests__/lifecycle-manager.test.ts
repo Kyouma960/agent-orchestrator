@@ -104,6 +104,7 @@ beforeEach(() => {
 
   mockSessionManager = {
     spawn: vi.fn(),
+    spawnProject: vi.fn(),
     spawnOrchestrator: vi.fn(),
     restore: vi.fn(),
     list: vi.fn().mockResolvedValue([]),
@@ -112,6 +113,7 @@ beforeEach(() => {
     cleanup: vi.fn(),
     send: vi.fn().mockResolvedValue(undefined),
     claimPR: vi.fn(),
+    mergeProject: vi.fn(),
   } as SessionManager;
 
   config = {

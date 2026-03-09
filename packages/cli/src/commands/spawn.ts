@@ -1,7 +1,7 @@
 import chalk from "chalk";
 import ora from "ora";
 import type { Command } from "commander";
-import { loadConfig, type OrchestratorConfig } from "@composio/ao-core";
+import { loadConfig, type OrchestratorConfig, type ParallelProjectResult, type MergeProjectResult } from "@composio/ao-core";
 import { exec } from "../lib/shell.js";
 import { banner } from "../lib/format.js";
 import { getSessionManager } from "../lib/create-session-manager.js";
@@ -164,6 +164,225 @@ export function registerSpawn(program: Command): void {
         }
       },
     );
+}
+
+export function registerSpawnProject(program: Command): void {
+  program
+    .command("spawn-project")
+    .description("Spawn a project-mode session (one branch, multiple tickets as commits)")
+    .argument("<project>", "Project ID from config")
+    .argument("[tracker-project]", "Tracker project ID, URL, or slug (fetches all open issues)")
+    .option("--issues <ids...>", "Ad-hoc list of issue IDs to work on together")
+    .option("--parallel", "Parallel mode: one agent per issue, combine into one PR later")
+    .option("--open", "Open session in terminal tab")
+    .option("--agent <name>", "Override the agent plugin (e.g. codex, claude-code)")
+    .option("--branch <name>", "Override the branch name")
+    .action(
+      async (
+        projectId: string,
+        trackerProjectId: string | undefined,
+        opts: {
+          issues?: string[];
+          parallel?: boolean;
+          open?: boolean;
+          agent?: string;
+          branch?: string;
+        },
+      ) => {
+        const config = loadConfig();
+        if (!config.projects[projectId]) {
+          console.error(
+            chalk.red(
+              `Unknown project: ${projectId}\nAvailable: ${Object.keys(config.projects).join(", ")}`,
+            ),
+          );
+          process.exit(1);
+        }
+
+        if (!trackerProjectId && (!opts.issues || opts.issues.length === 0)) {
+          console.error(
+            chalk.red(
+              "Either provide a tracker project ID or use --issues to specify issue IDs.\n" +
+                "Usage:\n" +
+                "  ao spawn-project <project> <tracker-project>\n" +
+                "  ao spawn-project <project> --issues SIL-1 SIL-2 SIL-3",
+            ),
+          );
+          process.exit(1);
+        }
+
+        const spinner = ora("Creating project session").start();
+
+        try {
+          await runSpawnPreflight(config, projectId);
+          await ensureLifecycleWorker(config, projectId);
+
+          const sm = await getSessionManager(config);
+
+          if (opts.parallel) {
+            spinner.text = "Spawning parallel project sessions";
+
+            const result = await sm.spawnProject({
+              projectId,
+              trackerProjectId,
+              issueIds: opts.issues,
+              agent: opts.agent,
+              branch: opts.branch,
+              parallel: true,
+            }) as ParallelProjectResult;
+
+            if (result.failedIssues?.length) {
+              spinner.warn(
+                `Parallel project: ${chalk.green(result.sessions.length)} spawned, ${chalk.red(`${result.failedIssues.length} failed`)}`,
+              );
+            } else {
+              spinner.succeed(
+                `Parallel project: ${chalk.green(result.sessions.length)} agents spawned`,
+              );
+            }
+
+            console.log(`  Project branch: ${chalk.dim(result.projectBranch)}`);
+            console.log(`  Group ID:       ${chalk.dim(result.groupId)}`);
+            console.log();
+            for (const session of result.sessions) {
+              const tmuxTarget = session.runtimeHandle?.id ?? session.id;
+              console.log(
+                `  ${chalk.green(session.id)} → ${session.issueId} (${chalk.dim(session.branch ?? "")})`,
+              );
+              if (opts.open) {
+                try {
+                  await exec("open-iterm-tab", [tmuxTarget]);
+                } catch {
+                  // best effort
+                }
+              }
+            }
+            if (result.failedIssues?.length) {
+              console.log();
+              console.log(chalk.red("Failed to spawn:"));
+              for (const f of result.failedIssues) {
+                console.log(`  ${chalk.red(f.issueId)}: ${f.error}`);
+              }
+            }
+            console.log();
+            console.log(
+              `When agents finish: ${chalk.cyan(`ao merge-project ${result.groupId}`)}`,
+            );
+            console.log();
+
+            // Output for scripting
+            console.log(`GROUP=${result.groupId}`);
+          } else {
+            spinner.text = "Spawning project session via core";
+
+            const session = await sm.spawnProject({
+              projectId,
+              trackerProjectId,
+              issueIds: opts.issues,
+              agent: opts.agent,
+              branch: opts.branch,
+            }) as import("@composio/ao-core").Session;
+
+            spinner.succeed(`Session ${chalk.green(session.id)} created`);
+
+            console.log(`  Worktree: ${chalk.dim(session.workspacePath ?? "-")}`);
+            if (session.branch) console.log(`  Branch:   ${chalk.dim(session.branch)}`);
+
+            const tmuxTarget = session.runtimeHandle?.id ?? session.id;
+            console.log(`  Attach:   ${chalk.dim(`tmux attach -t ${tmuxTarget}`)}`);
+            console.log();
+
+            // Output for scripting
+            console.log(`SESSION=${session.id}`);
+
+            if (opts.open) {
+              try {
+                await exec("open-iterm-tab", [tmuxTarget]);
+              } catch {
+                // Terminal plugin not available
+              }
+            }
+          }
+        } catch (err) {
+          spinner.fail("Failed to create project session");
+          console.error(chalk.red(`✗ ${err instanceof Error ? err.message : String(err)}`));
+          process.exit(1);
+        }
+      },
+    );
+}
+
+export function registerMergeProject(program: Command): void {
+  program
+    .command("merge-project")
+    .description("Merge parallel project branches into one PR")
+    .argument("<group-id>", "Parallel group ID (from spawn-project --parallel output)")
+    .action(async (groupId: string) => {
+      const config = loadConfig();
+      const spinner = ora("Merging parallel project").start();
+
+      try {
+        const sm = await getSessionManager(config);
+        spinner.text = "Finding sessions and merging branches";
+
+        const result = await sm.mergeProject(groupId) as MergeProjectResult;
+
+        if (result.merged.length === 0 && result.conflicts.length === 0) {
+          spinner.info("No sessions are ready to merge yet");
+          if (result.notReady.length > 0) {
+            console.log();
+            console.log(chalk.yellow("Still working:"));
+            for (const nr of result.notReady) {
+              console.log(`  ${nr.sessionId} (${nr.issueId}) — ${nr.status}`);
+            }
+          }
+          return;
+        }
+
+        if (result.conflicts.length > 0) {
+          spinner.warn(
+            `Merged ${result.merged.length}, ${chalk.red(`${result.conflicts.length} conflicts`)}`,
+          );
+          console.log();
+          console.log(chalk.yellow("Conflicting branches (resolve manually):"));
+          for (const c of result.conflicts) {
+            console.log(`  ${c.issueId}: git merge origin/${c.branch}`);
+          }
+          console.log();
+          console.log(`Project branch: ${chalk.dim(result.projectBranch)}`);
+          console.log("After resolving:");
+          console.log(`  git checkout ${result.projectBranch}`);
+          for (const c of result.conflicts) {
+            console.log(`  git merge origin/${c.branch}`);
+          }
+          console.log(`  git push origin ${result.projectBranch}`);
+        } else {
+          spinner.succeed(
+            `Merged ${chalk.green(String(result.merged.length))} branches into ${chalk.cyan(result.projectBranch)}`,
+          );
+        }
+
+        if (result.prUrl) {
+          console.log();
+          console.log(`  PR: ${chalk.green(result.prUrl)}`);
+        }
+
+        if (result.closedPRs.length > 0) {
+          console.log(`  Closed ${result.closedPRs.length} individual PRs: ${result.closedPRs.map((n) => `#${n}`).join(", ")}`);
+        }
+
+        if (result.notReady.length > 0) {
+          console.log();
+          console.log(chalk.yellow(`${result.notReady.length} session(s) still working — run merge-project again later`));
+        }
+
+        console.log();
+      } catch (err) {
+        spinner.fail("Failed to merge project");
+        console.error(chalk.red(`✗ ${err instanceof Error ? err.message : String(err)}`));
+        process.exit(1);
+      }
+    });
 }
 
 export function registerBatchSpawn(program: Command): void {

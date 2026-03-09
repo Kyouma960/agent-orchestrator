@@ -3,7 +3,7 @@
 import { Command } from "commander";
 import { registerInit } from "./commands/init.js";
 import { registerStatus } from "./commands/status.js";
-import { registerSpawn, registerBatchSpawn } from "./commands/spawn.js";
+import { registerSpawn, registerSpawnProject, registerBatchSpawn, registerMergeProject } from "./commands/spawn.js";
 import { registerSession } from "./commands/session.js";
 import { registerSend } from "./commands/send.js";
 import { registerReviewCheck } from "./commands/review-check.js";
@@ -24,7 +24,9 @@ registerStart(program);
 registerStop(program);
 registerStatus(program);
 registerSpawn(program);
+registerSpawnProject(program);
 registerBatchSpawn(program);
+registerMergeProject(program);
 registerSession(program);
 registerSend(program);
 registerReviewCheck(program);

@@ -13,9 +13,11 @@ const { mockExec, mockConfigRef, mockSessionManager, mockEnsureLifecycleWorker }
     cleanup: vi.fn(),
     get: vi.fn(),
     spawn: vi.fn(),
+    spawnProject: vi.fn(),
     spawnOrchestrator: vi.fn(),
     send: vi.fn(),
     claimPR: vi.fn(),
+    mergeProject: vi.fn(),
   },
   mockEnsureLifecycleWorker: vi.fn(),
 }));

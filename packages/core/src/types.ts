@@ -188,6 +188,44 @@ export interface OrchestratorSpawnConfig {
   systemPrompt?: string;
 }
 
+/**
+ * Config for spawning a project-mode session.
+ * Either `trackerProjectId` or `issueIds` must be provided.
+ */
+export interface ProjectSpawnConfig {
+  projectId: string;
+  /** Tracker project ID (e.g. Linear project UUID or URL) — fetches all open issues */
+  trackerProjectId?: string;
+  /** Ad-hoc list of issue IDs to work on together */
+  issueIds?: string[];
+  /** Override the agent plugin for this session */
+  agent?: string;
+  /** Override the branch name */
+  branch?: string;
+  /**
+   * Parallel mode: spawn one agent per issue (instead of one sequential agent).
+   * Each agent works on its own branch, commits + pushes, but does NOT create a PR.
+   * Use `ao merge-project` to combine all branches into one PR when done.
+   */
+  parallel?: boolean;
+}
+
+/**
+ * Result of a parallel project spawn — multiple sessions grouped together.
+ */
+export interface ParallelProjectResult {
+  /** Project branch that merge-project will combine into */
+  projectBranch: string;
+  /** Individual sessions, one per issue */
+  sessions: Session[];
+  /** Tracker project info (if resolved from tracker) */
+  trackerProject?: TrackerProject;
+  /** Group ID linking these sessions together */
+  groupId: string;
+  /** Issues that failed to spawn (partial failure) */
+  failedIssues?: Array<{ issueId: string; error: string }>;
+}
+
 // =============================================================================
 // RUNTIME — Plugin Slot 1
 // =============================================================================
@@ -465,6 +503,12 @@ export interface Tracker {
 
   /** Optional: create a new issue */
   createIssue?(input: CreateIssueInput, project: ProjectConfig): Promise<Issue>;
+
+  /** Optional: fetch a tracker project by ID */
+  getTrackerProject?(projectId: string, project: ProjectConfig): Promise<TrackerProject>;
+
+  /** Optional: list open issues belonging to a tracker project, sorted by priority */
+  listProjectIssues?(projectId: string, project: ProjectConfig): Promise<Issue[]>;
 }
 
 export interface Issue {
@@ -498,6 +542,16 @@ export interface CreateIssueInput {
   labels?: string[];
   assignee?: string;
   priority?: number;
+}
+
+/** A project in the issue tracker (e.g. a Linear project) */
+export interface TrackerProject {
+  id: string;
+  name: string;
+  description: string;
+  url: string;
+  state: string;
+  issueCount: number;
 }
 
 // =============================================================================
@@ -921,6 +975,12 @@ export interface ProjectConfig {
     | "kill-previous";
 
   opencodeIssueSessionStrategy?: "reuse" | "delete" | "ignore";
+
+  /** Max parallel agents for spawn-project --parallel (default: 6) */
+  maxParallelAgents?: number;
+
+  /** Command to validate merged code (e.g. "npm run type-check"). Runs in modules/web dir by default. */
+  validateCommand?: string;
 }
 
 export interface TrackerConfig {
@@ -1049,6 +1109,9 @@ export interface SessionMetadata {
   runtimeHandle?: string;
   restoredAt?: string;
   role?: string; // "orchestrator" for orchestrator sessions
+  trackerProjectId?: string; // Tracker project ID (for project-mode sessions)
+  parallelGroupId?: string; // Links sessions that belong to the same parallel project
+  parallelProjectBranch?: string; // Target branch for merge-project
   dashboardPort?: number;
   terminalWsPort?: number;
   directTerminalWsPort?: number;
@@ -1062,6 +1125,7 @@ export interface SessionMetadata {
 /** Session manager — CRUD for sessions */
 export interface SessionManager {
   spawn(config: SessionSpawnConfig): Promise<Session>;
+  spawnProject(config: ProjectSpawnConfig): Promise<Session | ParallelProjectResult>;
   spawnOrchestrator(config: OrchestratorSpawnConfig): Promise<Session>;
   restore(sessionId: SessionId): Promise<Session>;
   list(projectId?: string): Promise<Session[]>;
@@ -1073,6 +1137,8 @@ export interface SessionManager {
   ): Promise<CleanupResult>;
   send(sessionId: SessionId, message: string): Promise<void>;
   claimPR(sessionId: SessionId, prRef: string, options?: ClaimPROptions): Promise<ClaimPRResult>;
+  /** Merge all branches from a parallel project group into one branch and create a PR */
+  mergeProject(groupId: string): Promise<MergeProjectResult>;
 }
 
 /** OpenCode-specific session manager with remap capability */
@@ -1105,6 +1171,23 @@ export interface CleanupResult {
   killed: string[];
   skipped: string[];
   errors: Array<{ sessionId: string; error: string }>;
+}
+
+export interface MergeProjectResult {
+  /** The combined project branch */
+  projectBranch: string;
+  /** Branches that were successfully merged */
+  merged: Array<{ branch: string; issueId: string }>;
+  /** Branches that had merge conflicts */
+  conflicts: Array<{ branch: string; issueId: string }>;
+  /** Sessions that weren't ready yet (still working) */
+  notReady: Array<{ sessionId: string; issueId: string; status: string }>;
+  /** PR URL if one was created (null if conflicts prevented it) */
+  prUrl: string | null;
+  /** Individual PRs that were closed as superseded */
+  closedPRs: number[];
+  /** Validation errors (type-check failures after merge) */
+  validationErrors?: string;
 }
 
 /** Lifecycle manager — state machine + reaction engine */

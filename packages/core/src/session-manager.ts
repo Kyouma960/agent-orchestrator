@@ -1046,6 +1046,16 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
     }
 
     const { issues, trackerProject } = await resolveProjectIssues(spawnConfig, project, plugins);
+
+    // Enforce concurrency limit — too many parallel agents OOM the machine
+    const maxAgents = project.maxParallelAgents ?? 6;
+    if (issues.length > maxAgents) {
+      throw new Error(
+        `Too many parallel agents: ${issues.length} issues exceed limit of ${maxAgents}. ` +
+        `Set maxParallelAgents in project config to increase, or use sequential mode (omit --parallel).`
+      );
+    }
+
     const projectBranch = resolveProjectBranch(spawnConfig, trackerProject, issues);
     const groupId = `pg-${Date.now().toString(36)}`;
     const sessions: Session[] = [];
@@ -2674,6 +2684,29 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
       }
 
       if (result.merged.length > 0) {
+        // Post-merge validation: run type-check if configured
+        if (projectConfig.validateCommand) {
+          try {
+            execSync(projectConfig.validateCommand, {
+              ...mergeOpts,
+              timeout: 120_000, // 2 minute timeout for type-check
+            });
+          } catch (err: unknown) {
+            const stderr = (err as { stderr?: string }).stderr ?? "";
+            const stdout = (err as { stdout?: string }).stdout ?? "";
+            const output = (stderr + stdout).trim();
+            // Extract just the error lines for readability
+            const errorLines = output
+              .split("\n")
+              .filter((l: string) => l.includes("error TS") || l.includes("Error:"))
+              .slice(0, 20)
+              .join("\n");
+            result.validationErrors = errorLines || output.slice(0, 2000);
+            // Still push + create PR so the user can see what needs fixing,
+            // but include validation failures in the result
+          }
+        }
+
         // Use --force-with-lease for safer pushes (won't overwrite unexpected remote changes)
         execSync(`git push -u origin ${shellEscape(projectBranch)} --force-with-lease`, mergeOpts);
 

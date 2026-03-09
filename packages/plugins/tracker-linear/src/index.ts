@@ -12,6 +12,7 @@ import { request } from "node:https";
 import type {
   PluginModule,
   Tracker,
+  TrackerProject,
   Issue,
   IssueFilters,
   IssueUpdate,
@@ -265,6 +266,91 @@ const ISSUE_FIELDS = `
   assignee { name displayName }
   team { key }
 `;
+
+// ---------------------------------------------------------------------------
+// Linear project types
+// ---------------------------------------------------------------------------
+
+interface LinearProjectNode {
+  id: string;
+  name: string;
+  description: string;
+  url: string;
+  state: string;
+  issues: {
+    nodes: LinearIssueNode[];
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Project identifier parsing
+// ---------------------------------------------------------------------------
+
+/**
+ * Parse a Linear project identifier into a UUID.
+ * Accepts:
+ * - UUID: "abc123-def456-..."
+ * - URL: "https://linear.app/<workspace>/project/<slug>-<uuid>"
+ * - Slug-UUID: "my-project-abc123def456"
+ * - Project name: "Figma Integration" (looked up via Linear API)
+ *
+ * For URLs and slugs, extracts the trailing UUID portion.
+ * If the input is already a UUID, returns it as-is.
+ * If the input looks like a name, searches Linear projects by name.
+ */
+async function resolveLinearProjectId(input: string, query: GraphQLTransport): Promise<string> {
+  // Full UUID pattern
+  const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  if (uuidPattern.test(input)) return input;
+
+  // URL pattern: linear.app/.../project/<slug>-<uuid> or linear.app/.../project/<uuid>
+  const urlMatch = input.match(/linear\.app\/[^/]+\/project\/(?:.*-)?([0-9a-f-]{36})(?:\/|$)/i);
+  if (urlMatch) return urlMatch[1];
+
+  // If it looks like a UUID without dashes (32 hex chars), format it
+  const hexOnly = input.replace(/-/g, "");
+  if (/^[0-9a-f]{32}$/i.test(hexOnly)) {
+    return [
+      hexOnly.slice(0, 8),
+      hexOnly.slice(8, 12),
+      hexOnly.slice(12, 16),
+      hexOnly.slice(16, 20),
+      hexOnly.slice(20),
+    ].join("-");
+  }
+
+  // Not a UUID/URL — treat as a project name and search Linear
+  const data = await query<{
+    projects: { nodes: Array<{ id: string; name: string }> };
+  }>(
+    `query($name: String!) {
+      projects(filter: { name: { containsIgnoreCase: $name } }) {
+        nodes { id name }
+      }
+    }`,
+    { name: input },
+  );
+
+  const matches = data.projects.nodes;
+  if (matches.length === 0) {
+    throw new Error(
+      `No Linear project found matching "${input}". Use a project UUID, URL, or exact name.`,
+    );
+  }
+
+  // Prefer exact (case-insensitive) match, otherwise take the first result
+  const exact = matches.find((p) => p.name.toLowerCase() === input.toLowerCase());
+  const match = exact ?? matches[0];
+
+  if (matches.length > 1 && !exact) {
+    const names = matches.map((p) => `  - ${p.name} (${p.id})`).join("\n");
+    throw new Error(
+      `Multiple Linear projects match "${input}":\n${names}\nPass the exact name or UUID.`,
+    );
+  }
+
+  return match.id;
+}
 
 // ---------------------------------------------------------------------------
 // Tracker implementation
@@ -568,6 +654,72 @@ function createLinearTracker(query: GraphQLTransport): Tracker {
           { issueId: issueUuid, body: update.comment },
         );
       }
+    },
+
+    async getTrackerProject(
+      projectId: string,
+      _project: ProjectConfig,
+    ): Promise<TrackerProject> {
+      const resolvedId = await resolveLinearProjectId(projectId, query);
+      const data = await query<{ project: LinearProjectNode }>(
+        `query($id: String!) {
+          project(id: $id) {
+            id
+            name
+            description
+            url
+            state
+            issues(filter: { state: { type: { nin: ["completed", "canceled"] } } }) {
+              nodes {
+                ${ISSUE_FIELDS}
+              }
+            }
+          }
+        }`,
+        { id: resolvedId },
+      );
+
+      const node = data.project;
+      return {
+        id: node.id,
+        name: node.name,
+        description: node.description ?? "",
+        url: node.url,
+        state: node.state,
+        issueCount: node.issues.nodes.length,
+      };
+    },
+
+    async listProjectIssues(projectId: string, _project: ProjectConfig): Promise<Issue[]> {
+      const resolvedId = await resolveLinearProjectId(projectId, query);
+      const data = await query<{ project: { issues: { nodes: LinearIssueNode[] } } }>(
+        `query($id: String!) {
+          project(id: $id) {
+            issues(
+              filter: { state: { type: { nin: ["completed", "canceled"] } } }
+              orderBy: updatedAt
+            ) {
+              nodes {
+                ${ISSUE_FIELDS}
+              }
+            }
+          }
+        }`,
+        { id: resolvedId },
+      );
+
+      return data.project.issues.nodes
+        .sort((a, b) => a.priority - b.priority)
+        .map((node) => ({
+          id: node.identifier,
+          title: node.title,
+          description: node.description ?? "",
+          url: node.url,
+          state: mapLinearState(node.state.type),
+          labels: node.labels.nodes.map((l) => l.name),
+          assignee: node.assignee?.displayName ?? node.assignee?.name,
+          priority: node.priority,
+        }));
     },
 
     async createIssue(input: CreateIssueInput, project: ProjectConfig): Promise<Issue> {

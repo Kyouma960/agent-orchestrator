@@ -24,9 +24,11 @@ const { mockTmux, mockExec, mockGh, mockConfigRef, mockSessionManager, sessionsD
       cleanup: vi.fn(),
       get: vi.fn(),
       spawn: vi.fn(),
-      spawnOrchestrator: vi.fn(),
+      spawnProject: vi.fn(),
+    spawnOrchestrator: vi.fn(),
       send: vi.fn(),
       claimPR: vi.fn(),
+    mergeProject: vi.fn(),
     },
     sessionsDirRef: { current: "" },
   }));
